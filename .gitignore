@@ -1,2 +1,9 @@
 /src/quad_esp_downlaod_img/py_http_server/images
 src/quad_esp_downlaod_img/py_http_server/server.log
+/src/4.quad_esp_downlaod_img/py_http_server/images
+/src/4.quad_esp_downlaod_img/quad_espidf_img_download/build
+/src/5. qesp_logging/py_http_server/images
+/src/4.quad_esp_downlaod_img/quad_esp_downlaod_img/.theia
+/src/4.quad_esp_downlaod_img/quad_espidf_img_download/.devcontainer
+/src/4.quad_esp_downlaod_img/quad_espidf_img_download/.vscode
+*.log

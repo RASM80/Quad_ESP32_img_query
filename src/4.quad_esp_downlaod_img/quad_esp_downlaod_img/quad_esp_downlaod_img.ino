@@ -8,11 +8,11 @@
 
 
 // WiFi credentials (update as needed)
-const char* ssid = "RASM";
-const char* password = "1234qwert";
+const char* ssid = "RnD";
+const char* password = "wnOPxFSCxb";
 
 // Server and image URLs
-const char* serverUrl = "http://192.168.215.219:5000";
+const char* serverUrl = "http://192.168.10.100:5000";
 
 
 const char* imageUrl = "https://fastly.picsum.photos/id/682/800/600.jpg?hmac=nDvj6j28PV7_q1jWXRsp0xS7jtAZYzHophmak9J1ymU";
@@ -107,14 +107,40 @@ void setup() {
 
   // Connect to WiFi with retries
   currentLedState = LED_CONNECTING_WIFI;
-  int wifiRetries = 0;
-  const int maxWifiRetries = 10;
-  while (WiFi.status() != WL_CONNECTED && wifiRetries < maxWifiRetries) {
-    WiFi.begin(ssid, password);
-    delay(5000);
-    Serial.println("Connecting to WiFi...");
-    wifiRetries++;
-  }
+
+  // Define timeout and retry parameters
+  const unsigned long connectionTimeout = 10000; // 10 seconds timeout per attempt
+  const int maxRetries = 5; 
+  bool wifi_success = false;
+  WiFi.mode(WIFI_STA); // Set ESP32 as a WiFi station
+    delay(500);          // Optional: give time for mode to set
+
+    int retryCount = 0;
+    while (retryCount < maxRetries) {
+        Serial.print("Attempting to connect to WiFi, attempt ");
+        Serial.println(retryCount + 1);
+
+        WiFi.begin(ssid, password); // Start connection attempt
+
+        unsigned long startTime = millis();
+        while (millis() - startTime < connectionTimeout) {
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("Connected to WiFi successfully!");
+                Serial.print("IP Address: ");
+                Serial.println(WiFi.localIP());
+                WiFi.setAutoReconnect(true); // Enable auto-reconnect if connection drops
+                wifi_success = true;
+                break;
+            }
+            delay(100); // Check every 100ms (non-blocking)
+        }
+        if(wifi_success) break;
+
+        Serial.println("Connection attempt timed out");
+        WiFi.disconnect(); // Reset connection state
+        retryCount++;
+        delay(500); // Short delay before retrying
+    }
 
   if (WiFi.status() == WL_CONNECTED) {
     currentLedState = LED_WIFI_CONNECTED;
