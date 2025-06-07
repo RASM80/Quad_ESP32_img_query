@@ -6,7 +6,7 @@
 #include <freertos/queue.h>
 #include <esp_heap_caps.h>
 #include <FastLED.h>
-#include "esp_camera.h"  // Added for camera support
+#include "esp_camera.h"
 
 // Camera pin definitions for CAMERA_MODEL_ESP32S3_EYE
 #define PWDN_GPIO_NUM -1
@@ -27,21 +27,23 @@
 #define PCLK_GPIO_NUM 13
 
 // WiFi credentials (update as needed)
-const char* ssid = "RASM";
-const char* password = "1234qwert";
+const char* ssid = "RnD";
+const char* password = "wnOPxFSCxb";
 
 // Server and image URLs
-const char* serverUrl = "http://192.168.187.199:5000";
+const char* serverUrl = "http://192.168.10.100:5000";
 const char* imageUrl = "https://fastly.picsum.photos/id/682/800/600.jpg?hmac=nDvj6j28PV7_q1jWXRsp0xS7jtAZYzHophmak9J1ymU";
 
-// Image buffer size (1MB, well within 2MB PSRAM limit)
-#define IMAGE_SIZE (1024 * 1024)
-uint8_t* image_buffer;
-size_t image_size = 0;  // Actual size of the downloaded/captured image
+// Image buffer size (1MB per buffer, 2MB total within 8MB PSRAM)
+#define IMAGE_SIZE (512 * 1024)
+uint8_t* buffers[2];    // Two buffers in PSRAM
+size_t image_sizes[2];  // Actual size of each captured image
+int next_capture = 0;   // Next buffer index for capture task
+int next_send = 0;      // Next buffer index for send task
 
-// Semaphores for task synchronization
-SemaphoreHandle_t image_ready_sem;
-SemaphoreHandle_t sending_complete_sem;
+// Semaphores for double buffer synchronization
+SemaphoreHandle_t empty_sem;  // Counting semaphore for empty buffers
+SemaphoreHandle_t full_sem;   // Counting semaphore for full buffers
 
 // Queue for log messages
 QueueHandle_t log_queue;
@@ -83,30 +85,6 @@ void log_message(const String& message) {
   }
 }
 
-// Function to download image from internet (kept for reference, not used)
-bool download_image(uint8_t* buffer, size_t max_size, size_t* out_size) {
-  HTTPClient http;
-  http.begin(imageUrl);
-  int httpCode = http.GET();
-  if (httpCode == HTTP_CODE_OK) {
-    size_t len = http.getSize();
-    if (len > max_size) {
-      log_message("Image too large for buffer");
-      http.end();
-      return false;
-    }
-    http.getStream().readBytes(buffer, len);
-    *out_size = len;
-    log_message("Image downloaded successfully");
-    http.end();
-    return true;
-  } else {
-    log_message("Failed to download image, HTTP code: " + String(httpCode));
-    http.end();
-    return false;
-  }
-}
-
 // Function to capture image from OV5640 camera
 bool capture_image(uint8_t* buffer, size_t max_size, size_t* out_size) {
   camera_fb_t* fb = esp_camera_fb_get();  // Get a frame from the camera
@@ -131,9 +109,12 @@ bool capture_image(uint8_t* buffer, size_t max_size, size_t* out_size) {
   return true;
 }
 
-// Function pointer for image acquisition (updated to use camera)
+// Function pointer for image acquisition
 typedef bool (*acquire_image_func_t)(uint8_t* buffer, size_t max_size, size_t* out_size);
-acquire_image_func_t acquire_image = capture_image;  // Now uses camera capture
+acquire_image_func_t acquire_image = capture_image;
+
+void IRAM_ATTR get_image_task(void* pvParameters);
+void IRAM_ATTR image_send_task(void* pvParameters);
 
 // Task handles
 TaskHandle_t getImageTaskHandle = NULL;
@@ -192,19 +173,56 @@ void setup() {
   const int maxRetries = 5;
   bool wifi_success = false;
   WiFi.mode(WIFI_STA);  // Set ESP32 as a WiFi station
+  WiFi.disconnect();
   delay(500);           // Optional: give time for mode to set
 
+
+  Serial.println("Scanning networks...");
+  int n = WiFi.scanNetworks();  // Scan for WiFi networks
+  if (n == 0) {
+    Serial.println("No networks found");
+  } else {
+    Serial.print(n);
+    Serial.println(" networks found:");
+    for (int i = 0; i < n; ++i) {
+      Serial.print(i + 1);
+      Serial.print(": ");
+      Serial.print(WiFi.SSID(i));  // Print SSID
+      Serial.print(" (");
+      Serial.print(WiFi.RSSI(i));  // Print signal strength
+      Serial.println(" dBm)");
+    }
+  }
+
+
+  WiFi.begin(ssid, password);  // Start connection attempt
+  WiFi.setAutoReconnect(true);
+
+  delay(1000);
+
+  Serial.println("\r\n Connecting.");
+  while(WiFi.status() != WL_CONNECTED){
+    delay(1000);
+    Serial.print("WIFI LOOP: ");
+    Serial.println(WiFi.status());
+    // if(Wifi.status() == WL_CONNECTED) break;
+  }
+
+/*
   int retryCount = 0;
   while (retryCount < maxRetries) {
     log_message("Attempting to connect to WiFi, attempt " + String(retryCount + 1));
     WiFi.begin(ssid);  // Start connection attempt
+    WiFi.setAutoReconnect(true);
+
+    delay(2000);
 
     unsigned long startTime = millis();
     while (millis() - startTime < connectionTimeout) {
       if (WiFi.status() == WL_CONNECTED) {
         log_message("Connected to WiFi successfully! RSSI: " + String(WiFi.RSSI()));
         log_message("IP Address: " + WiFi.localIP().toString());
-        WiFi.setAutoReconnect(true);  // Enable auto-reconnect if connection drops
+        // WiFi.setAutoReconnect(true);  // Enable auto-reconnect if connection drops
         wifi_success = true;
         break;
       }
@@ -213,10 +231,12 @@ void setup() {
     if (wifi_success) break;
 
     log_message("Connection attempt timed out");
+    
     WiFi.disconnect();  // Reset connection state
     retryCount++;
     delay(500);  // Short delay before retrying
   }
+  */
 
   if (WiFi.status() == WL_CONNECTED) {
     currentLedState = LED_WIFI_CONNECTED;
@@ -228,10 +248,11 @@ void setup() {
       ;  // Halt or handle failure
   }
 
-  // Allocate image buffer in PSRAM
-  image_buffer = (uint8_t*)heap_caps_malloc(IMAGE_SIZE, MALLOC_CAP_SPIRAM);
-  if (image_buffer == NULL) {
-    log_message("Failed to allocate PSRAM buffer");
+  // Allocate image buffers in PSRAM
+  buffers[0] = (uint8_t*)heap_caps_malloc(IMAGE_SIZE, MALLOC_CAP_SPIRAM);
+  buffers[1] = (uint8_t*)heap_caps_malloc(IMAGE_SIZE, MALLOC_CAP_SPIRAM);
+  if (buffers[0] == NULL || buffers[1] == NULL) {
+    log_message("Failed to allocate PSRAM buffers");
     while (1)
       ;
   }
@@ -256,11 +277,11 @@ void setup() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;        // 20MHz clock frequency
-  config.pixel_format = PIXFORMAT_JPEG;  // JPEG format for compression
-  config.frame_size = FRAMESIZE_HD;  
-  config.jpeg_quality = 5;               // Quality 10 (0-63, lower is higher quality)
-  config.fb_count = 2;                   // Single frame buffer
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_HD;
+  config.jpeg_quality = 5;
+  config.fb_count = 1;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -269,10 +290,9 @@ void setup() {
       ;
   }
 
-  // Get the camera sensor and configure vertical flip
   sensor_t* sensor = esp_camera_sensor_get();
   if (sensor != NULL) {
-    sensor->set_vflip(sensor, 1);  // Enable vertical flip
+    sensor->set_vflip(sensor, 1);
     log_message("Vertical flip enabled");
   } else {
     log_message("Failed to get camera sensor");
@@ -280,11 +300,14 @@ void setup() {
 
   log_message("Camera initialized successfully");
 
-
-
-  // Create semaphores
-  image_ready_sem = xSemaphoreCreateBinary();
-  sending_complete_sem = xSemaphoreCreateBinary();
+  // Create semaphores for double buffering
+  empty_sem = xSemaphoreCreateCounting(2, 2);  // Both buffers start empty
+  full_sem = xSemaphoreCreateCounting(2, 0);   // No buffers start full
+  if (empty_sem == NULL || full_sem == NULL) {
+    log_message("Failed to create semaphores");
+    while (1)
+      ;
+  }
 
   // Create tasks
   xTaskCreate(get_image_task, "GET_IMAGE_TASK", 4096, NULL, 1, &getImageTaskHandle);
@@ -293,13 +316,14 @@ void setup() {
 
 void loop() {
   delay(1000);  // Main loop is empty; tasks handle the work
+  vTaskDelete(NULL);
 }
 
 // LED Update Task
 void ledUpdateTask(void* parameter) {
   while (true) {
     updateLed();
-    vTaskDelay(500 / portTICK_PERIOD_MS);  // Update every 500ms for visible blinking
+    vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 }
 
@@ -348,46 +372,70 @@ void updateLed() {
   FastLED.show();
 }
 
-// Task to acquire and save image to PSRAM
-void get_image_task(void* pvParameters) {
+// Task to acquire and save image to PSRAM using double buffering
+void IRAM_ATTR get_image_task(void* pvParameters) {
   while (true) {
+    // Wait for an empty buffer
+    xSemaphoreTake(empty_sem, portMAX_DELAY);
+
+    int buffer_to_capture = next_capture;
+    next_capture = (next_capture + 1) % 2;
+
     currentLedState = LED_ACQUIRING_IMAGE;
     log_message("Starting to acquire image, RSSI: " + String(WiFi.RSSI()));
-    bool success = acquire_image(image_buffer, IMAGE_SIZE, &image_size);
+
+    bool success = capture_image(buffers[buffer_to_capture], IMAGE_SIZE, &image_sizes[buffer_to_capture]);
     if (success) {
       currentLedState = LED_IMAGE_SAVED;
-      log_message("Image acquired and saved to PSRAM");
+      log_message("Image acquired and saved to PSRAM, buffer: " + String(buffer_to_capture));
     } else {
       currentLedState = LED_IMAGE_ACQUIRE_FAILED;
       log_message("Failed to acquire image; retrying in 1s");
       vTaskDelay(1000 / portTICK_PERIOD_MS);
+      xSemaphoreGive(empty_sem);  // Reclaim the empty semaphore on failure
+      continue;
     }
-    xSemaphoreGive(image_ready_sem);
-    xSemaphoreTake(sending_complete_sem, portMAX_DELAY);
+
+    // Signal that a buffer is full
+    xSemaphoreGive(full_sem);
   }
 }
 
-// Task to send image to server
-void image_send_task(void* pvParameters) {
+// Task to send image to server using double buffering
+void IRAM_ATTR image_send_task(void* pvParameters) {
   while (true) {
-    xSemaphoreTake(image_ready_sem, portMAX_DELAY);
+    // Wait for a full buffer
+    xSemaphoreTake(full_sem, portMAX_DELAY);
+
+    int buffer_to_send = next_send;
+    next_send = (next_send + 1) % 2;
+
     currentLedState = LED_WAITING_SERVER_ACK;
     log_message("Requesting server acknowledgment, RSSI: " + String(WiFi.RSSI()));
-    if (get_server_ack()) {
+
+    if (get_server_ack()) 
+    {
       currentLedState = LED_SERVER_ACK_RECEIVED;
       currentLedState = LED_SENDING_IMAGE;
-      log_message("Sending image, size: " + String(image_size) + ", RSSI: " + String(WiFi.RSSI()));
-      if (send_image_to_server()) {
+      log_message("Sending image from buffer: " + String(buffer_to_send) + ", size: " + String(image_sizes[buffer_to_send]) + ", RSSI: " + String(WiFi.RSSI()));
+      if (send_image_to_server(buffers[buffer_to_send], image_sizes[buffer_to_send])) 
+      {
         currentLedState = LED_IMAGE_SENT_SUCCESS;
-      } else {
+      } 
+      else 
+      {
         currentLedState = LED_IMAGE_SENT_FAILED;
         log_message("Failed to send image");
       }
-    } else {
+    } 
+    else 
+    {
       currentLedState = LED_IMAGE_SENT_FAILED;
       log_message("Server acknowledgment failed");
     }
-    xSemaphoreGive(sending_complete_sem);
+
+    // Signal that the buffer is empty
+    xSemaphoreGive(empty_sem);
   }
 }
 
@@ -411,12 +459,12 @@ bool get_server_ack() {
 }
 
 // Function to send image to server
-bool send_image_to_server() {
+bool send_image_to_server(uint8_t* buffer, size_t size) {
   HTTPClient http;
   http.begin(String(serverUrl) + "/send_image");
   http.addHeader("X-Device-ID", WiFi.macAddress());
   http.addHeader("Content-Type", "image/jpeg");
-  int httpCode = http.POST(image_buffer, image_size);
+  int httpCode = http.POST(buffer, size);
   http.end();
   if (httpCode == HTTP_CODE_OK) {
     log_message("Image sent successfully");

@@ -10,3 +10,6 @@ src/quad_esp_downlaod_img/py_http_server/server.log
 /src/6. first_cam/py_http_server/images
 *.png
 /src/7. camera_feed/py_http_server/static
+/src/8. ds_camera_feed/ov5640_query/.theia
+/src/8. ds_camera_feed/py_http_server/static
+/src/quirc
