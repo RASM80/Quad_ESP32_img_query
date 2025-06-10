@@ -13,3 +13,11 @@ src/quad_esp_downlaod_img/py_http_server/server.log
 /src/8. ds_camera_feed/ov5640_query/.theia
 /src/8. ds_camera_feed/py_http_server/static
 /src/quirc
+/src/esp_idf_camera_feed/build
+/src/esp_idf_camera_feed/managed_components
+/src/8. camera_idf/ds_camera_feed/.vscode
+/src/8. camera_idf/ds_camera_feed/build
+/src/8. camera_idf/ds_camera_feed/managed_components
+/src/9. qrcode_compatible/py_http_server/static
+/src/8. camera_idf/ds_camera_feed/.devcontainer
+/src/8. camera_idf/py_http_server/static
