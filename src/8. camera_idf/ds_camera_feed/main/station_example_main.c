@@ -13,13 +13,14 @@
 #include "led_strip.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "defines.h"
 
 // WiFi credentials
 #define WIFI_SSID "RnD"
 #define WIFI_PASS "wnOPxFSCxb"
 
 // Server URL
-#define SERVER_URL "http://192.168.10.102:5000"
+#define SERVER_URL "http://192.168.10.103:5000"
 
 // Image buffer size (512KB per buffer)
 #define IMAGE_SIZE (512 * 1024)
@@ -60,20 +61,24 @@ static LedState currentLedState = LED_IDLE;
 static bool wifi_connected = false;
 static char mac_address[18];
 
+static const char *WIFI_EVENT_TAG = "wifi_event";
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        wifi_connected = false;
         currentLedState = LED_CONNECTING_WIFI;
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_connected = false;
         esp_wifi_connect();
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        wifi_connected = true;
         currentLedState = LED_WIFI_CONNECTED;
-        ESP_LOGI("WiFi", "Connected to WiFi");
+        ESP_LOGI(WIFI_EVENT_TAG, "Connected to WiFi");
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(WIFI_EVENT_TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
     }
 }
 
@@ -102,8 +107,8 @@ static void wifi_init(void) {
     // Initialize and start WiFi
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = DEFAULT_SSID,
-            .password = DEFAULT_PWD,
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
             .scan_method = DEFAULT_SCAN_METHOD,
             .sort_method = DEFAULT_SORT_METHOD,
             .threshold.rssi = DEFAULT_RSSI,
@@ -114,6 +119,9 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(40));
 
     currentLedState = LED_CONNECTING_WIFI;
 }
@@ -349,15 +357,14 @@ void app_main(void) {
     get_mac_address();
 
     // Wait for WiFi connection with timeout
-    const uint32_t timeout_ms = 120000;  // 30 seconds
-    uint32_t start_time = esp_timer_get_time() / 1000;  // Current time in ms
+    const uint32_t timeout_ms = 10000; 
+    uint32_t start_time = esp_timer_get_time() / 1000;
     while (!wifi_connected) {
         uint32_t current_time = esp_timer_get_time() / 1000;
         if (current_time - start_time >= timeout_ms) {
             ESP_LOGE("APP", "WiFi connection timeout");
             currentLedState = LED_WIFI_FAILED;
-            break;
-            // return;
+            esp_restart();
         }
         vTaskDelay(100 / portTICK_PERIOD_MS);  // Wait 100ms
     }
@@ -375,22 +382,6 @@ void app_main(void) {
 
     // Initialize camera
     camera_config_t config = {
-            // config.pin_d0 = 8;
-            // config.pin_d1 = 9;
-            // config.pin_d2 = 18;
-            // config.pin_d3 = 10;
-            // config.pin_d4 = 17;
-            // config.pin_d5 = 11;
-            // config.pin_d6 = 16;
-            // config.pin_d7 = 12;
-            // config.pin_xclk = 15;
-            // config.pin_pclk = 13;
-            // config.pin_vsync = 6;
-            // config.pin_href = 7;
-            // config.pin_sccb_sda = 4;
-            // config.pin_sccb_scl = 5;
-            // config.pin_pwdn = PWDN_GPIO_NUM;
-            // config.pin_reset = RESET_GPIO_NUM;
 
         // .pin_pwdn = -1,
         // .pin_reset = -1,
@@ -408,7 +399,7 @@ void app_main(void) {
         // .pin_vsync = 6,
         // .pin_href = 7,
         // .pin_pclk = 13,
-          .pin_d0 = 8,
+        .pin_d0 = 8,
         .pin_d1 = 9,
         .pin_d2 = 18,
         .pin_d3 = 10,
