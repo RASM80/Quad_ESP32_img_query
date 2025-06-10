@@ -16,11 +16,16 @@
 #include "defines.h"
 
 // WiFi credentials
-#define WIFI_SSID "RnD"
-#define WIFI_PASS "wnOPxFSCxb"
+// #define WIFI_SSID "RnD"
+// #define WIFI_PASS "wnOPxFSCxb"
+
+#define WIFI_SSID "esp"
+#define WIFI_PASS "12345678"
 
 // Server URL
-#define SERVER_URL "http://192.168.10.103:5000"
+// #define SERVER_URL "http://192.168.10.103:5000"
+#define SERVER_URL "http://192.168.187.207:5000"
+
 
 // Image buffer size (512KB per buffer)
 #define IMAGE_SIZE (512 * 1024)
@@ -62,6 +67,9 @@ static bool wifi_connected = false;
 static char mac_address[18];
 
 static const char *WIFI_EVENT_TAG = "wifi_event";
+static const char *SERVER_LOG = "SERVER_LOG";
+static const char *CAPTURE_TASK = "CAPTURE_TASK";
+static const char *SEND_IMG_TASK = "SEND_TASK";
 
 static void event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
@@ -146,7 +154,7 @@ static void log_to_server(const char* message) {
     esp_http_client_set_post_field(client, message, strlen(message));
     esp_err_t err = esp_http_client_perform(client);
     if (err != ESP_OK) {
-        ESP_LOGE("HTTP", "Log failed: %s", esp_err_to_name(err));
+        ESP_LOGE(SERVER_LOG, "Log failed: %s", esp_err_to_name(err));
     }
     esp_http_client_cleanup(client);
 }
@@ -164,9 +172,10 @@ static void log_send_task(void* pvParameters) {
     }
 }
 
+
 // Log message function
 static void log_message(const char* message) {
-    ESP_LOGI("APP", "%s", message);
+    // ESP_LOGI(SERVER_LOG, "%s", message);
     if (log_queue != NULL) {
         char* msg = strdup(message);
         if (msg && xQueueSend(log_queue, &msg, 0) != pdTRUE) {
@@ -175,29 +184,80 @@ static void log_message(const char* message) {
     }
 }
 
+static const char 
+    *cap_fail = "Camera capture failed",
+    *format_fail = "Non-JPEG data not supported",
+    *storage_fail = "Image too large for buffer",
+    *cap_success = "Image captured successfully";
+
 // Capture image from camera
 static bool capture_image(uint8_t* buffer, size_t max_size, size_t* out_size) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
-        log_message("Camera capture failed");
+        ESP_LOGE(CAPTURE_TASK, "%s", cap_fail);
+        log_message(cap_fail);
         return false;
     }
     if (fb->format != PIXFORMAT_JPEG) {
-        log_message("Non-JPEG data not supported");
+        ESP_LOGE(CAPTURE_TASK, "%s", format_fail);
+        log_message(format_fail);
         esp_camera_fb_return(fb);
         return false;
     }
     if (fb->len > max_size) {
-        log_message("Image too large for buffer");
+        ESP_LOGE(CAPTURE_TASK, "%s", storage_fail);
+        log_message(storage_fail);
         esp_camera_fb_return(fb);
         return false;
     }
     memcpy(buffer, fb->buf, fb->len);
     *out_size = fb->len;
     esp_camera_fb_return(fb);
-    log_message("Image captured successfully");
+    ESP_LOGI(CAPTURE_TASK, "%s", cap_success);
+    log_message(cap_success);
     return true;
 }
+
+
+static const char 
+    *img_cap_init = "Starting to acquire image",
+    *img_cap_done = "Image saved to PSRAM",
+    *img_cap_fail = "Image capture failure, SEND_IMAGE semaphore will not be released!";
+
+// Image capture task
+static void get_image_task(void* pvParameters) {
+    while (true) {
+        xSemaphoreTake(empty_sem, portMAX_DELAY);
+        int buffer_to_capture = next_capture;
+        next_capture = (next_capture + 1) % 2;
+
+        currentLedState = LED_ACQUIRING_IMAGE;
+        ESP_LOGI(CAPTURE_TASK, "%s", img_cap_init);
+        log_message(img_cap_init);
+
+        if (capture_image(buffers[buffer_to_capture], IMAGE_SIZE, &image_sizes[buffer_to_capture])) {
+            currentLedState = LED_IMAGE_SAVED;
+
+            ESP_LOGI(CAPTURE_TASK, "%s", img_cap_done);
+            log_message(img_cap_done);
+        } else {
+            currentLedState = LED_IMAGE_ACQUIRE_FAILED;
+
+            ESP_LOGE(CAPTURE_TASK, "%s", img_cap_fail);
+            log_message(img_cap_fail);
+
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            xSemaphoreGive(empty_sem);
+            continue;
+        }
+        xSemaphoreGive(full_sem);
+    }
+}
+
+
+static const char 
+    *ack_rdy = "Server acknowledged: ready",
+    *ack_fail = "Server ack failed";
 
 // Get server acknowledgment
 static bool get_server_ack(void) {
@@ -207,22 +267,51 @@ static bool get_server_ack(void) {
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
     esp_http_client_set_header(client, "X-Device-ID", mac_address);
-    esp_err_t err = esp_http_client_perform(client);
     bool success = false;
-    if (err == ESP_OK && esp_http_client_get_status_code(client) == 200) {
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGI(SEND_IMG_TASK, "HTTP status: %d", status_code);
         char response[16];
         int len = esp_http_client_read_response(client, response, sizeof(response) - 1);
         response[len] = '\0';
-        if (strcmp(response, "ready") == 0) {
-            log_message("Server acknowledged: ready");
-            success = true;
+        ESP_LOGI(SEND_IMG_TASK, "Response: %s", response);
+        if (status_code == 200 && strcmp(response, "ready") == 0) {
+        ESP_LOGI(SEND_IMG_TASK, "%s", ack_rdy);
+        log_message(ack_rdy);
+        success = true;
         }
-    } else {
-        log_message("Server ack failed");
     }
+    else {
+        ESP_LOGE(SEND_IMG_TASK, "HTTP error: %s", esp_err_to_name(err));
+        ESP_LOGE(SEND_IMG_TASK, "%s", ack_fail);
+        log_message(ack_fail);
+    }
+
+    // if (err == ESP_OK) {
+    // int status_code = esp_http_client_get_status_code(client);
+    // ESP_LOGI(SEND_IMG_TASK, "HTTP status: %d", status_code);
+    // char response[16];
+    // int len = esp_http_client_read_response(client, response, sizeof(response) - 1);
+    // response[len] = '\0';
+    // ESP_LOGI(SEND_IMG_TASK, "Response: %s", response);
+    // if (status_code == 200 && strcmp(response, "ready") == 0) {
+    //     ESP_LOGI(SEND_IMG_TASK, "%s", ack_rdy);
+    //     log_message(ack_rdy);
+    //     success = true;
+    // }
+
+
+
     esp_http_client_cleanup(client);
     return success;
 }
+
+
+static const char 
+    *img_sent = "Image sent successfully",
+    *server_send_fail = "Failed to send image";
 
 // Send image to server
 static bool send_image_to_server(uint8_t* buffer, size_t size) {
@@ -237,36 +326,21 @@ static bool send_image_to_server(uint8_t* buffer, size_t size) {
     esp_err_t err = esp_http_client_perform(client);
     bool success = (err == ESP_OK && esp_http_client_get_status_code(client) == 200);
     if (success) {
-        log_message("Image sent successfully");
+        ESP_LOGI(SEND_IMG_TASK, "%s", img_sent);
+        log_message(img_sent);
     } else {
-        log_message("Failed to send image");
+        ESP_LOGE(SEND_IMG_TASK, "%s", server_send_fail);
+        log_message(server_send_fail);
     }
     esp_http_client_cleanup(client);
     return success;
 }
 
-// Image capture task
-static void get_image_task(void* pvParameters) {
-    while (true) {
-        xSemaphoreTake(empty_sem, portMAX_DELAY);
-        int buffer_to_capture = next_capture;
-        next_capture = (next_capture + 1) % 2;
 
-        currentLedState = LED_ACQUIRING_IMAGE;
-        log_message("Starting to acquire image");
-
-        if (capture_image(buffers[buffer_to_capture], IMAGE_SIZE, &image_sizes[buffer_to_capture])) {
-            currentLedState = LED_IMAGE_SAVED;
-            log_message("Image saved to PSRAM");
-        } else {
-            currentLedState = LED_IMAGE_ACQUIRE_FAILED;
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            xSemaphoreGive(empty_sem);
-            continue;
-        }
-        xSemaphoreGive(full_sem);
-    }
-}
+static const char 
+    *req_ack = "Requesting server acknowledgment",
+    *sending_image = "Sending image",
+    *send_fail = "Sending Image to server failed!";
 
 // Image send task
 static void image_send_task(void* pvParameters) {
@@ -276,16 +350,22 @@ static void image_send_task(void* pvParameters) {
         next_send = (next_send + 1) % 2;
 
         currentLedState = LED_WAITING_SERVER_ACK;
-        log_message("Requesting server acknowledgment");
+        ESP_LOGI(SEND_IMG_TASK, "%s", req_ack);
+        log_message(req_ack);
 
-        if (get_server_ack()) {
+        // if (get_server_ack()) {
+        if (true) {
             currentLedState = LED_SERVER_ACK_RECEIVED;
             currentLedState = LED_SENDING_IMAGE;
-            log_message("Sending image");
+            ESP_LOGI(SEND_IMG_TASK, "%s", sending_image);
+            log_message(sending_image);
             if (send_image_to_server(buffers[buffer_to_send], image_sizes[buffer_to_send])) {
                 currentLedState = LED_IMAGE_SENT_SUCCESS;
             } else {
                 currentLedState = LED_IMAGE_SENT_FAILED;
+
+                ESP_LOGE(SEND_IMG_TASK, "%s", send_fail);
+
             }
         } else {
             currentLedState = LED_IMAGE_SENT_FAILED;
@@ -399,6 +479,8 @@ void app_main(void) {
         // .pin_vsync = 6,
         // .pin_href = 7,
         // .pin_pclk = 13,
+
+        // swappaed VSYNC and SCL
         .pin_d0 = 8,
         .pin_d1 = 9,
         .pin_d2 = 18,
@@ -409,10 +491,10 @@ void app_main(void) {
         .pin_d7 = 12,
         .pin_xclk = 15,
         .pin_pclk = 13,
-        .pin_vsync = 6,
+        .pin_vsync = 5,
         .pin_href = 7,
         .pin_sccb_sda = 4,
-        .pin_sccb_scl = 5,
+        .pin_sccb_scl = 6,
         .pin_pwdn = -1,
         .pin_reset = -1,
         .xclk_freq_hz = 20000000,
